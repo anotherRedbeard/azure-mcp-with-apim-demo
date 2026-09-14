@@ -1,0 +1,658 @@
+<policies>
+  <inbound>
+    <base />
+
+    <!-- User input. -->
+    <choose>
+      <when condition="@(context.Request.Body != null)">
+        <set-variable name="requestBody" value="@(context.Request.Body.As<JObject>(preserveContent: true))" />
+
+        <!-- System prompt. -->
+        <set-variable name="systemMessage" value="@{
+          var body = (JObject)context.Variables["requestBody"];
+          var instructions = body["instructions"]?.ToString();
+          return instructions ?? "";
+        }" />
+
+        <!-- Model. -->
+        <set-variable name="model" value="@{
+          var body = (JObject)context.Variables["requestBody"];
+          var modelValue = body["model"]?.ToString();
+          if (!string.IsNullOrEmpty(modelValue)) {
+            return modelValue;
+          }
+
+          // MCP (JSON-RPC) tool call - tag the guard payload with "mcp:<method>[:<tool>]".
+          if (body["jsonrpc"] != null) {
+            var method = body["method"]?.ToString() ?? "";
+            var toolName = body["params"]?["name"]?.ToString();
+            return string.IsNullOrEmpty(toolName) ? $"mcp:{method}" : $"mcp:{method}:{toolName}";
+          }
+
+          return "";
+        }" />
+
+        <!-- Extract messages for input guardrail: latest assistant message + all user messages after it. -->
+        <set-variable name="conversationMessages" value="@{
+          var body = (JObject)context.Variables["requestBody"];
+          var input = body["input"];
+
+          if (input == null) {
+            // MCP (JSON-RPC) tool call - send the tool name + arguments as the "user" content
+            // so CrowdStrike sees/logs what the MCP client is asking the tool to do.
+            if (body["jsonrpc"] != null && body["method"]?.ToString() == "tools/call") {
+              var toolName = body["params"]?["name"]?.ToString() ?? "";
+              var toolArgs = body["params"]?["arguments"] ?? new JObject();
+              var mcpContent = new JObject(
+                new JProperty("tool", toolName),
+                new JProperty("arguments", toolArgs)
+              ).ToString();
+
+              var mcpMessages = new JArray();
+              mcpMessages.Add(new JObject(
+                new JProperty("role", "user"),
+                new JProperty("content", mcpContent)
+              ));
+              return mcpMessages;
+            }
+
+            return new JArray();
+          }
+
+          var messages = new JArray();
+
+          // If input is a string, it's a single user message.
+          if (input.Type == JTokenType.String) {
+            var text = input.ToString();
+            if (!string.IsNullOrEmpty(text)) {
+              messages.Add(new JObject(
+                new JProperty("role", "user"),
+                new JProperty("content", text)
+              ));
+            }
+            return messages;
+          }
+
+          // If input is an array, find the latest assistant message and extract messages after it.
+          if (input.Type == JTokenType.Array) {
+            var inputArray = (JArray)input;
+            int lastAssistantIndex = -1;
+
+            // Find the index of the last assistant message.
+            for (int i = inputArray.Count - 1; i >= 0; i--) {
+              var item = inputArray[i];
+              var itemType = item["type"]?.ToString();
+              if (itemType == "message") {
+                var role = item["role"]?.ToString();
+                if (role == "assistant") {
+                  lastAssistantIndex = i;
+                  break;
+                }
+              }
+            }
+
+            // If there's a latest assistant message, include it and all user messages after it.
+            if (lastAssistantIndex >= 0) {
+              // Add the latest assistant message.
+              var assistantItem = inputArray[lastAssistantIndex];
+              var assistantContent = assistantItem["content"];
+              var assistantText = "";
+              if (assistantContent != null && assistantContent.Type == JTokenType.Array) {
+                var contentArray = (JArray)assistantContent;
+                foreach (var contentItem in contentArray) {
+                  var contentType = contentItem["type"]?.ToString();
+                  if (contentType == "input_text") {
+                    assistantText += contentItem["text"]?.ToString() ?? "";
+                  }
+                }
+              }
+              if (!string.IsNullOrEmpty(assistantText)) {
+                messages.Add(new JObject(
+                  new JProperty("role", "assistant"),
+                  new JProperty("content", assistantText)
+                ));
+              }
+
+              // Add all user messages after the latest assistant message.
+              for (int i = lastAssistantIndex + 1; i < inputArray.Count; i++) {
+                var item = inputArray[i];
+                var itemType = item["type"]?.ToString();
+                if (itemType == "message") {
+                  var role = item["role"]?.ToString();
+                  if (role == "user") {
+                    var userContent = item["content"];
+                    var userText = "";
+                    if (userContent != null && userContent.Type == JTokenType.Array) {
+                      var contentArray = (JArray)userContent;
+                      foreach (var contentItem in contentArray) {
+                        var contentType = contentItem["type"]?.ToString();
+                        if (contentType == "input_text") {
+                          userText += contentItem["text"]?.ToString() ?? "";
+                        }
+                      }
+                    }
+                    if (!string.IsNullOrEmpty(userText)) {
+                      messages.Add(new JObject(
+                        new JProperty("role", "user"),
+                        new JProperty("content", userText)
+                      ));
+                    }
+                  }
+                }
+              }
+            } else {
+              // No assistant message found, include all user messages.
+              foreach (var item in inputArray) {
+                var itemType = item["type"]?.ToString();
+                if (itemType == "message") {
+                  var role = item["role"]?.ToString();
+                  if (role == "user") {
+                    var userContent = item["content"];
+                    var userText = "";
+                    if (userContent != null && userContent.Type == JTokenType.Array) {
+                      var contentArray = (JArray)userContent;
+                      foreach (var contentItem in contentArray) {
+                        var contentType = contentItem["type"]?.ToString();
+                        if (contentType == "input_text") {
+                          userText += contentItem["text"]?.ToString() ?? "";
+                        }
+                      }
+                    }
+                    if (!string.IsNullOrEmpty(userText)) {
+                      messages.Add(new JObject(
+                        new JProperty("role", "user"),
+                        new JProperty("content", userText)
+                      ));
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          return messages;
+        }" />
+
+        <choose>
+          <when condition="@(((JArray)context.Variables["conversationMessages"]).Count > 0 || !string.IsNullOrEmpty((string)context.Variables["systemMessage"]))">
+            <set-variable name="aiGuardInputPayload" value="@{
+              var messages = new JArray();
+
+              // Add system prompt.
+              var systemMsg = (string)context.Variables["systemMessage"];
+              if (!string.IsNullOrEmpty(systemMsg)) {
+                messages.Add(new JObject(
+                  new JProperty("role", "system"),
+                  new JProperty("content", systemMsg)
+                ));
+              }
+
+              // Add conversation messages (latest assistant + user messages after it).
+              var convMsgs = (JArray)context.Variables["conversationMessages"];
+              if (convMsgs != null && convMsgs.Count > 0) {
+                foreach (var msg in convMsgs) {
+                  messages.Add(new JObject(
+                    new JProperty("role", msg["role"]?.ToString() ?? "user"),
+                    new JProperty("content", msg["content"]?.ToString() ?? "")
+                  ));
+                }
+              }
+
+              var payload = new JObject(
+                new JProperty("guard_input", new JObject(
+                  new JProperty("messages", messages)
+                )),
+                new JProperty("event_type", "input")
+              );
+
+              // Add model.
+              var model = (string)context.Variables["model"];
+              if (!string.IsNullOrEmpty(model)) {
+                payload["model"] = model;
+              }
+
+              return payload.ToString();
+            }" />
+
+            <!-- Guard input. -->
+            <send-request mode="new" response-variable-name="aiGuardInputResponse" timeout="30" ignore-error="false">
+              <set-url>@("{{ai-guard-url}}/v1/guard_chat_completions")</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Authorization" exists-action="override">
+                <value>@("Bearer {{ai-guard-token}}")</value>
+              </set-header>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-body>@((string)context.Variables["aiGuardInputPayload"])</set-body>
+            </send-request>
+
+            <set-variable name="aiGuardInputResult" value="@(((IResponse)context.Variables["aiGuardInputResponse"]).Body.As<JObject>())" />
+
+            <!-- Check if blocked. -->
+            <set-variable name="isBlocked" value="@{
+              var result = (JObject)context.Variables["aiGuardInputResult"];
+              var resultObj = result["result"] as JObject;
+              if (resultObj != null && resultObj["blocked"] != null) {
+                return resultObj["blocked"].Value<bool>();
+              }
+              return false;
+            }" />
+
+            <choose>
+              <when condition="@((bool)context.Variables["isBlocked"])">
+                <!-- Request blocked by AIDR. -->
+                <return-response>
+                  <set-status code="403" reason="Forbidden" />
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                  </set-header>
+                  <set-body>@{
+                    var errorResponse = new JObject(
+                      new JProperty("error", new JObject(
+                        new JProperty("message", "Request blocked by AI Guard security policy"),
+                        new JProperty("type", "invalid_request_error"),
+                        new JProperty("code", "content_filtered")
+                      ))
+                    );
+                    return errorResponse.ToString();
+                  }</set-body>
+                </return-response>
+              </when>
+            </choose>
+
+            <!-- Check if transformed and update request body. -->
+            <set-variable name="isTransformed" value="@{
+              var result = (JObject)context.Variables["aiGuardInputResult"];
+              var resultObj = result["result"] as JObject;
+              if (resultObj != null && resultObj["transformed"] != null) {
+                return resultObj["transformed"].Value<bool>();
+              }
+              return false;
+            }" />
+
+            <choose>
+              <when condition="@((bool)context.Variables["isTransformed"])">
+                <!-- Update request body with transformed messages -->
+                <set-variable name="transformedOutput" value="@{
+                  var result = (JObject)context.Variables["aiGuardInputResult"];
+                  var resultObj = result["result"] as JObject;
+                  if (resultObj != null && resultObj["guard_output"] != null) {
+                    return resultObj["guard_output"];
+                  }
+                  return null;
+                }" />
+
+                <choose>
+                  <when condition="@(context.Variables["transformedOutput"] != null)">
+                    <set-variable name="transformedMessages" value="@(((JObject)context.Variables["transformedOutput"])["messages"])" />
+
+                    <choose>
+                      <when condition="@(context.Variables["transformedMessages"] != null)">
+                        <!-- Update the request body with transformed content (only user messages, system message never transformed) -->
+                        <set-variable name="updatedRequestBody" value="@{
+                          var body = (JObject)context.Variables["requestBody"];
+                          var messages = (JArray)context.Variables["transformedMessages"];
+
+                          // Extract transformed user messages only (system messages are never transformed)
+                          var transformedUserMsgs = new JArray();
+
+                          foreach (var msg in messages) {
+                            var role = msg["role"]?.ToString();
+                            var content = msg["content"]?.ToString();
+                            // Only extract user messages - system messages are never transformed
+                            if (role == "user" && !string.IsNullOrEmpty(content)) {
+                              transformedUserMsgs.Add(content);
+                            }
+                          }
+
+                          // Update input based on original format (only user messages are transformed)
+                          var originalInput = body["input"];
+                          if (originalInput != null && originalInput.Type == JTokenType.String) {
+                            // Simple string input - update with first transformed user message
+                            if (transformedUserMsgs.Count > 0) {
+                              body["input"] = transformedUserMsgs[0].ToString();
+                            }
+                          } else if (originalInput != null && originalInput.Type == JTokenType.Array) {
+                            // Array input - update user messages in the array
+                            var inputArray = (JArray)originalInput;
+                            var updatedInputArray = new JArray();
+                            int userMsgIndex = 0;
+
+                            foreach (var item in inputArray) {
+                              var itemType = item["type"]?.ToString();
+                              if (itemType == "message") {
+                                var role = item["role"]?.ToString();
+                                // Only transform user messages - system/developer messages are preserved as-is
+                                if (role == "user" && userMsgIndex < transformedUserMsgs.Count) {
+                                  // Update user message content
+                                  var updatedItem = item.DeepClone() as JObject;
+                                  var contentArray = new JArray();
+                                  contentArray.Add(new JObject(
+                                    new JProperty("type", "input_text"),
+
+                                    new JProperty("text", transformedUserMsgs[userMsgIndex].ToString())
+                                  ));
+                                  updatedItem["content"] = contentArray;
+                                  updatedInputArray.Add(updatedItem);
+                                  userMsgIndex++;
+                                } else {
+                                  // Preserve system/developer messages and other items unchanged
+                                  updatedInputArray.Add(item);
+                                }
+                              } else {
+                                updatedInputArray.Add(item);
+                              }
+                            }
+
+                            body["input"] = updatedInputArray;
+                          }
+
+                          // Note: instructions field (system message) is never updated - it remains unchanged
+
+                          return body.ToString();
+                        }" />
+
+                        <set-body>@((string)context.Variables["updatedRequestBody"])</set-body>
+                      </when>
+                    </choose>
+                  </when>
+                </choose>
+              </when>
+            </choose>
+          </when>
+        </choose>
+      </when>
+    </choose>
+  </inbound>
+
+  <backend>
+    <base />
+  </backend>
+
+  <outbound>
+    <base />
+
+    <!--
+      MCP-aware guard: normalize both OpenAI-style JSON responses and MCP
+      streamable-HTTP responses (which are typically Server-Sent Events,
+      Content-Type: text/event-stream, carrying the JSON-RPC message in a
+      "data: " line) into a single "responseBody" JObject. Anything that
+      doesn't parse falls back to null and is skipped instead of throwing.
+    -->
+    <set-variable name="responseBody" value="@{
+      if (context.Response == null || context.Response.Body == null) {
+        return null;
+      }
+
+      var contentType = context.Response.Headers?.GetValueOrDefault("Content-Type", "") ?? "";
+
+      try {
+        if (contentType.IndexOf("application/json", StringComparison.OrdinalIgnoreCase) >= 0) {
+          // Plain JSON response: OpenAI Responses API, or a non-streamed MCP JSON-RPC response.
+          return context.Response.Body.As<JObject>(preserveContent: true);
+        }
+
+        if (contentType.IndexOf("text/event-stream", StringComparison.OrdinalIgnoreCase) >= 0) {
+          // MCP streamable-HTTP SSE response - pull the JSON-RPC payload out of the "data:" line.
+          var raw = context.Response.Body.As<string>(preserveContent: true);
+          foreach (var line in raw.Split('\n')) {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("data:")) {
+              var json = trimmed.Substring(5).Trim();
+              if (!string.IsNullOrEmpty(json)) {
+                var parsed = JObject.Parse(json);
+                if (parsed["result"] != null || parsed["error"] != null) {
+                  return parsed;
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // Not JSON / not a shape we understand - fall through and skip guard processing below.
+      }
+
+      return null;
+    }" />
+
+    <choose>
+      <when condition="@(context.Response != null && context.Response.Body != null)">
+        <choose>
+          <when condition="@(context.Variables["responseBody"] != null)">
+            <!-- Extract assistant message: OpenAI "output" array, or MCP JSON-RPC "result.content". -->
+            <set-variable name="assistantMessage" value="@{
+              var body = (JObject)context.Variables["responseBody"];
+
+              // OpenAI Responses API shape.
+              var output = body["output"] as JArray;
+              if (output != null) {
+                foreach (var item in output) {
+                  var itemType = item["type"]?.ToString();
+                  var role = item["role"]?.ToString();
+                  if (itemType == "message" && role == "assistant") {
+                    var content = item["content"] as JArray;
+                    if (content != null) {
+                      var textContent = "";
+                      foreach (var contentItem in content) {
+                        var contentType = contentItem["type"]?.ToString();
+                        if (contentType == "output_text") {
+                          textContent += contentItem["text"]?.ToString() ?? "";
+                        }
+                      }
+                      if (!string.IsNullOrEmpty(textContent)) {
+                        return textContent;
+                      }
+                    }
+                  }
+                }
+              }
+
+              // MCP (JSON-RPC) tool call result shape: { result: { content: [ { type: "text", text: "..." } ] } }.
+              var mcpContent = body["result"]?["content"] as JArray;
+              if (mcpContent != null) {
+                var textContent = "";
+                foreach (var contentItem in mcpContent) {
+                  if (contentItem["type"]?.ToString() == "text") {
+                    textContent += contentItem["text"]?.ToString() ?? "";
+                  }
+                }
+                if (!string.IsNullOrEmpty(textContent)) {
+                  return textContent;
+                }
+              }
+
+              return "";
+            }" />
+
+            <!-- Get system message from stored variable (set in inbound section) -->
+            <set-variable name="systemMessage" value="@{
+              // Get from stored variable (set during inbound processing)
+              if (context.Variables.ContainsKey("systemMessage")) {
+                return (string)context.Variables["systemMessage"];
+              }
+              return "";
+            }" />
+
+            <choose>
+              <when condition="@(!string.IsNullOrEmpty((string)context.Variables["assistantMessage"]))">
+                <!-- Build AI Guard request payload with system and assistant messages -->
+                <set-variable name="aiGuardOutputPayload" value="@{
+                  var messages = new JArray();
+
+                  // Add system message if present
+                  var systemMsg = (string)context.Variables["systemMessage"];
+                  if (!string.IsNullOrEmpty(systemMsg)) {
+                    messages.Add(new JObject(
+                      new JProperty("role", "system"),
+                      new JProperty("content", systemMsg)
+                    ));
+                  }
+
+                  // Add assistant message
+                  var assistantMsg = (string)context.Variables["assistantMessage"];
+                  if (!string.IsNullOrEmpty(assistantMsg)) {
+                    messages.Add(new JObject(
+                      new JProperty("role", "assistant"),
+                      new JProperty("content", assistantMsg)
+                    ));
+                  }
+
+                  var payload = new JObject(
+                    new JProperty("guard_input", new JObject(
+                      new JProperty("messages", messages)
+                    )),
+                    new JProperty("event_type", "output")
+                  );
+
+                  // Add model parameter if present (from stored variable set in inbound section)
+                  if (context.Variables.ContainsKey("model")) {
+                    var model = (string)context.Variables["model"];
+                    if (!string.IsNullOrEmpty(model)) {
+                      payload["model"] = model;
+                    }
+                  }
+
+                  return payload.ToString();
+                }" />
+
+                <!-- Guard output. -->
+                <send-request mode="new" response-variable-name="aiGuardOutputResponse" timeout="30" ignore-error="false">
+                  <set-url>@("{{ai-guard-url}}/v1/guard_chat_completions")</set-url>
+                  <set-method>POST</set-method>
+                  <set-header name="Authorization" exists-action="override">
+                    <value>@("Bearer {{ai-guard-token}}")</value>
+                  </set-header>
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                  </set-header>
+                  <set-body>@((string)context.Variables["aiGuardOutputPayload"])</set-body>
+                </send-request>
+
+                <set-variable name="aiGuardOutputResult" value="@(((IResponse)context.Variables["aiGuardOutputResponse"]).Body.As<JObject>())" />
+
+                <!-- Check if blocked -->
+                <set-variable name="isBlocked" value="@{
+                  var result = (JObject)context.Variables["aiGuardOutputResult"];
+                  var resultObj = result["result"] as JObject;
+                  if (resultObj != null && resultObj["blocked"] != null) {
+                    return resultObj["blocked"].Value<bool>();
+                  }
+                  return false;
+                }" />
+
+                <choose>
+                  <when condition="@((bool)context.Variables["isBlocked"])">
+                    <!-- Response blocked by AI Guard. -->
+                    <return-response>
+                      <set-status code="403" reason="Forbidden" />
+                      <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                      </set-header>
+                      <set-body>@{
+                        var errorResponse = new JObject(
+                          new JProperty("error", new JObject(
+                            new JProperty("message", "Response blocked by AI Guard security policy"),
+                            new JProperty("type", "invalid_request_error"),
+                            new JProperty("code", "content_filtered")
+                          ))
+                        );
+                        return errorResponse.ToString();
+                      }</set-body>
+                    </return-response>
+                  </when>
+                </choose>
+
+                <!-- Check if transformed and update response body if needed. -->
+                <set-variable name="isTransformed" value="@{
+                  var result = (JObject)context.Variables["aiGuardOutputResult"];
+                  var resultObj = result["result"] as JObject;
+                  if (resultObj != null && resultObj["transformed"] != null) {
+                    return resultObj["transformed"].Value<bool>();
+                  }
+                  return false;
+                }" />
+
+                <choose>
+                  <when condition="@((bool)context.Variables["isTransformed"])">
+                    <!-- Update response body with transformed content. -->
+                    <set-variable name="transformedOutput" value="@{
+                      var result = (JObject)context.Variables["aiGuardOutputResult"];
+                      var resultObj = result["result"] as JObject;
+                      if (resultObj != null && resultObj["guard_output"] != null) {
+                        return resultObj["guard_output"];
+                      }
+                      return null;
+                    }" />
+
+                    <choose>
+                      <when condition="@(context.Variables["transformedOutput"] != null)">
+                        <set-variable name="transformedMessages" value="@(((JObject)context.Variables["transformedOutput"])["messages"])" />
+
+                        <choose>
+                          <when condition="@(context.Variables["transformedMessages"] != null)">
+                            <!-- Find the assistant message in transformed output. -->
+                            <set-variable name="transformedAssistantContent" value="@{
+                              var messages = (JArray)context.Variables["transformedMessages"];
+                              foreach (var msg in messages) {
+                                var role = msg["role"]?.ToString();
+                                if (role == "assistant") {
+                                  return msg["content"]?.ToString() ?? "";
+                                }
+                              }
+                              return "";
+                            }" />
+
+                            <choose>
+                              <when condition="@(!string.IsNullOrEmpty((string)context.Variables["transformedAssistantContent"]))">
+                                <!-- Update the response body with transformed assistant message -->
+                                <set-variable name="updatedResponseBody" value="@{
+                                  var body = (JObject)context.Variables["responseBody"];
+                                  var output = body["output"] as JArray;
+                                  if (output != null) {
+                                    foreach (var item in output) {
+                                      var itemType = item["type"]?.ToString();
+                                      var role = item["role"]?.ToString();
+                                      if (itemType == "message" && role == "assistant") {
+                                        var contentArray = new JArray();
+                                        contentArray.Add(new JObject(
+                                          new JProperty("type", "output_text"),
+                                          new JProperty("text", (string)context.Variables["transformedAssistantContent"]),
+                                          new JProperty("annotations", new JArray())
+                                        ));
+                                        ((JObject)item)["content"] = contentArray;
+                                        break;
+                                      }
+                                    }
+                                  }
+                                  return body.ToString();
+                                }" />
+
+                                <set-body>@((string)context.Variables["updatedResponseBody"])</set-body>
+                              </when>
+                            </choose>
+                          </when>
+                        </choose>
+                      </when>
+                    </choose>
+                  </when>
+                </choose>
+              </when>
+            </choose>
+          </when>
+        </choose>
+      </when>
+    </choose>
+  </outbound>
+
+  <on-error>
+    <base />
+    <choose>
+      <when condition="@(context.LastError != null)">
+        <trace source="AIDR Policy Error">
+          @("Error: " + context.LastError.Message)
+        </trace>
+      </when>
+    </choose>
+  </on-error>
+</policies>
