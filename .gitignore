@@ -1,0 +1,10 @@
+## .NET
+bin/
+obj/
+
+## Deployment artifacts / secrets
+.env.mcp-demo
+.deploy-outputs.json
+
+## OS
+.DS_Store
